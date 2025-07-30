@@ -25,6 +25,28 @@ in its entirety but to provide a pragmatic, easy-to-use wrapper that is good
 enough for fine-tuning and inference workflows.
 """
 
+import math
+
+# --------------------------------------------------------------------------------------
+# Positional encoding helpers
+# --------------------------------------------------------------------------------------
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Standard transformer sinusoidal positional encoding."""
+
+    def __init__(self, dim: int, max_len: int = 10000):
+        super().__init__()
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Add positional encodings to *x* (B, T, D)."""
+        return x + self.pe[:, : x.size(1)]
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any
@@ -59,33 +81,29 @@ class AVHubertConfig(PretrainedConfig):
 
     def __init__(
         self,
-        audio_model_name: str = "facebook/hubert-base-ls960",
         vision_relu_type: str = "prelu",
         vision_weights: Optional[str] = None,
         fusion_hidden_size: int = 768,
-        modality_fuse: str = "concat",  # "concat" | "add"
+        modality_fuse: str = "add",  # "add"|"concat" – fusion *before* transformer
         dropout: float = 0.1,
-        mask_audio: bool = False,
-        mask_image: bool = False,
-        mask_prob_audio: float = 0.65,
-        mask_length_audio: int = 10,
-        mask_prob_image: float = 0.65,
-        mask_length_image: int = 10,
+        audio_feat_dim: int = 80,
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        intermediate_size: int = 3072,
         **kwargs,
     ) -> None:
-        self.audio_model_name = audio_model_name
         self.vision_relu_type = vision_relu_type
         self.vision_weights = vision_weights
         self.fusion_hidden_size = fusion_hidden_size
         self.modality_fuse = modality_fuse
         self.dropout = dropout
 
-        self.mask_audio = mask_audio
-        self.mask_image = mask_image
-        self.mask_prob_audio = mask_prob_audio
-        self.mask_length_audio = mask_length_audio
-        self.mask_prob_image = mask_prob_image
-        self.mask_length_image = mask_length_image
+        self.audio_feat_dim = audio_feat_dim
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
 
         super().__init__(**kwargs)
 
@@ -113,36 +131,33 @@ class AVHubertModel(PreTrainedModel):
     def __init__(self, config: AVHubertConfig):
         super().__init__(config)
 
-        # AUDIO ---------------------------------------------------------------------------------
-        self.audio_model = HubertModel.from_pretrained(
-            config.audio_model_name
-        ) if isinstance(config.audio_model_name, str) else HubertModel(config.audio_model_name)  # type: ignore[arg-type]
+        # AUDIO -------------------------------------------------------------------------------
+        self.audio_proj = nn.Linear(config.audio_feat_dim, config.hidden_size)
 
-        audio_hidden = self.audio_model.config.hidden_size
-
-        # VISION --------------------------------------------------------------------------------
+        # VISION ------------------------------------------------------------------------------
         self.vision_model = ResEncoder(config.vision_relu_type, config.vision_weights)
-        vision_hidden = self.vision_model.backend_out  # 512 for ResEncoder
+        self.vision_proj = nn.Linear(self.vision_model.backend_out, config.hidden_size)
 
-        # FUSION -------------------------------------------------------------------------------
-        if config.modality_fuse not in {"concat", "add"}:
-            raise ValueError("`modality_fuse` must be 'concat' or 'add'.")
+        # Positional encoding (shared)
+        self.pos_enc = SinusoidalPositionalEncoding(config.hidden_size)
 
+        # Transformer encoder for fusion ------------------------------------------------------
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,
+            nhead=config.num_attention_heads,
+            dim_feedforward=config.intermediate_size,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_hidden_layers)
+
+        # Fusion method specific layer when concatenating
         if config.modality_fuse == "concat":
-            fusion_in = audio_hidden + vision_hidden
-        else:  # add – dimensions *must* match
-            if audio_hidden != vision_hidden:
-                # Project vision to audio dimension so shapes match for addition.
-                self.vision_proj = nn.Linear(vision_hidden, audio_hidden)
-                vision_hidden = audio_hidden
-            fusion_in = audio_hidden  # unchanged
+            self.concat_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
 
-        self.fusion_proj = nn.Linear(fusion_in, config.fusion_hidden_size)
-        self.layer_norm = nn.LayerNorm(config.fusion_hidden_size)
+        # Classifier / projection head --------------------------------------------------------
         self.dropout = nn.Dropout(config.dropout)
-
-        # A very small classification head – replace/extend as needed.
-        self.classifier = nn.Linear(config.fusion_hidden_size, config.fusion_hidden_size)
+        self.classifier = nn.Linear(config.hidden_size, config.fusion_hidden_size)
 
         # weight init for new layers ------------------------------------------------------------
         self.post_init()
@@ -171,7 +186,7 @@ class AVHubertModel(PreTrainedModel):
     # -------------------------------------------------------------------------------- forward
     def forward(
         self,
-        input_values: Tensor,  # Audio waveform (B, L)
+        audio_features: Tensor,  # (B, T, feature_dim)
         video_frames: Tensor,  # (B, 1, T, H, W)
         attention_mask: Optional[Tensor] = None,
         output_hidden_states: bool = False,
@@ -188,29 +203,26 @@ class AVHubertModel(PreTrainedModel):
             5-D tensor with shape *(batch, 1, time, height, width)*
         """
 
-        audio_out = self.audio_model(
-            input_values=input_values,
-            attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
-        audio_feats: Tensor = audio_out.last_hidden_state  # (B, T_a, D_a)
+        # Assumes *audio_features* are already extracted (e.g., log-Mel)
+        audio_feats = self.audio_proj(audio_features)  # (B, T, H)
+
 
         vision_feats: Tensor = self.vision_model(video_frames)  # (B, D_v, T_v)
         vision_feats = self._align_modalities(audio_feats, vision_feats)
+        vision_feats = self.vision_proj(vision_feats)
 
-        if hasattr(self, "vision_proj"):
-            vision_feats = self.vision_proj(vision_feats)
-
+        # Fuse modalities (add or concat before transformer)
         if self.config.modality_fuse == "concat":
             fused = torch.cat([audio_feats, vision_feats], dim=-1)
-        else:  # add
+            fused = self.concat_proj(fused)
+        else:  # default 'add'
             fused = audio_feats + vision_feats
 
-        fused = self.fusion_proj(fused)
-        fused = self.layer_norm(fused)
-        fused = self.dropout(fused)
+        # Positional encoding + Transformer
+        fused = self.pos_enc(fused)
+        fused = self.transformer(fused)  # (B, T, H)
 
+        fused = self.dropout(fused)
         logits = self.classifier(fused)
 
         if not return_dict:
@@ -218,8 +230,7 @@ class AVHubertModel(PreTrainedModel):
 
         return {
             "logits": logits,
-            "last_hidden_state": fused,
-            "audio_hidden_states": audio_out.hidden_states if output_hidden_states else None,
+            "hidden_states": fused,
         }
 
     # --------------------------------------------------------------------------- loading utils
