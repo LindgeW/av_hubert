@@ -1,5 +1,30 @@
+# Core dependencies
+torch>=1.9.0
+torchaudio>=0.9.0
+transformers>=4.20.0
+datasets>=2.0.0
+accelerate>=0.20.0
+
+# Audio and video processing
 python-speech-features==0.6
-scipy==1.5.4
-opencv-python==4.5.4.60
-sentencepiece==0.1.96
-editdistance==0.6.0
+scipy>=1.7.0
+opencv-python>=4.5.0
+librosa>=0.9.0
+soundfile>=0.10.0
+
+# Text processing
+sentencepiece>=0.1.96
+editdistance>=0.6.0
+tokenizers>=0.13.0
+
+# Utilities
+numpy>=1.21.0
+omegaconf>=2.1.0
+hydra-core>=1.1.0
+tqdm>=4.62.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional dependencies for development
+jupyter>=1.0.0
+ipywidgets>=7.6.0
