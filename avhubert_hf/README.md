@@ -39,26 +39,49 @@ pip install -r requirements.txt
 ### Basic Usage
 
 ```python
+# Recommended: Import from main package
 from avhubert_hf import AVHubertModel, AVHubertConfig, AVHubertProcessor
 import torch
 
 # Load configuration and model
-config = AVHubertConfig.from_pretrained("facebook/avhubert-base")
-model = AVHubertModel.from_pretrained("facebook/avhubert-base")
+config = AVHubertConfig()  # or .from_pretrained("facebook/avhubert-base")
+model = AVHubertModel(config)  # or .from_pretrained("facebook/avhubert-base")
 processor = AVHubertProcessor()
 
 # Process audio and video inputs
 audio_input = torch.randn(1, 16000)  # 1 second of audio at 16kHz
 video_input = torch.randn(1, 25, 96, 96)  # 1 second of video at 25fps
 
-# Forward pass
-outputs = model(
-    audio_values=audio_input,
-    video_values=video_input
+# Process inputs
+inputs = processor(
+    audio=audio_input,
+    video=video_input,
+    return_tensors="pt"
 )
+
+# Forward pass
+outputs = model(**inputs)
 
 # Get hidden states
 hidden_states = outputs.last_hidden_state
+```
+
+### Import Patterns
+
+```python
+# ✅ Recommended: Main package imports
+from avhubert_hf import (
+    AVHubertConfig, AVHubertModel, AVHubertProcessor, 
+    AVHubertDataset, compute_mask_indices
+)
+
+# ✅ Alternative: Submodule imports (for advanced usage)
+from avhubert_hf.models import AVHubertConfig
+from avhubert_hf.data import AVHubertDataset
+from avhubert_hf.modules import MultiheadAttention, TransformerEncoder
+
+# ✅ For development/research: Direct module access
+from avhubert_hf.modules import LayerNorm, GradMultiply, ResEncoder
 ```
 
 ### Fine-tuning for Lip Reading
