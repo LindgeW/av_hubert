@@ -12,3 +12,4 @@ tqdm>=4.60.0
 librosa>=0.8.0
 matplotlib>=3.3.0
 pillow>=8.0.0
+pandas>=1.3.0
